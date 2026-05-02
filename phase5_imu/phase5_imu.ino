@@ -29,6 +29,11 @@ const float ACCEL_SCALE = 16384.0;  // LSB/g
 const float GYRO_SCALE  = 131.0;   // LSB/(°/s)
 
 // ============================================================================
+// GYRO CALIBRATION OFFSETS
+// ============================================================================
+float gxOffset = 0, gyOffset = 0, gzOffset = 0;
+
+// ============================================================================
 // TIMING
 // ============================================================================
 unsigned long lastReportTime = 0;
@@ -53,19 +58,45 @@ IMUData readIMU() {
   d.ay = (int16_t)(Wire.read() << 8 | Wire.read()) / ACCEL_SCALE;
   d.az = (int16_t)(Wire.read() << 8 | Wire.read()) / ACCEL_SCALE;
   Wire.read(); Wire.read();  // temperature (skip)
-  d.gx = (int16_t)(Wire.read() << 8 | Wire.read()) / GYRO_SCALE;
-  d.gy = (int16_t)(Wire.read() << 8 | Wire.read()) / GYRO_SCALE;
-  d.gz = (int16_t)(Wire.read() << 8 | Wire.read()) / GYRO_SCALE;
+  d.gx = (int16_t)(Wire.read() << 8 | Wire.read()) / GYRO_SCALE - gxOffset;
+  d.gy = (int16_t)(Wire.read() << 8 | Wire.read()) / GYRO_SCALE - gyOffset;
+  d.gz = (int16_t)(Wire.read() << 8 | Wire.read()) / GYRO_SCALE - gzOffset;
   return d;
+}
+
+// ============================================================================
+// GYRO CALIBRATION
+// ============================================================================
+void calibrateGyro() {
+  Serial.println(F("Calibrating gyro — keep robot still..."));
+  const int SAMPLES = 200;
+  float sx = 0, sy = 0, sz = 0;
+  for (int i = 0; i < SAMPLES; i++) {
+    delay(5);
+    IMUData d = readIMU();
+    sx += d.gx;
+    sy += d.gy;
+    sz += d.gz;
+  }
+  gxOffset = sx / SAMPLES;
+  gyOffset = sy / SAMPLES;
+  gzOffset = sz / SAMPLES;
+  Serial.print(F("Gyro offsets (deg/s): "));
+  Serial.print(gxOffset, 2); Serial.print(F("  "));
+  Serial.print(gyOffset, 2); Serial.print(F("  "));
+  Serial.println(gzOffset, 2);
 }
 
 // ============================================================================
 // LIFTED DETECTION
 // ============================================================================
+const float LIFTED_ACCEL_THRESHOLD = 0.5;   // g   — catches free-fall / inversion; raise if false-triggers on hard floor impacts
+const float LIFTED_GYRO_THRESHOLD  = 25.0;  // °/s — roll/pitch only (gz excluded: turning on flat ground is pure yaw and must not trigger LIFTED)
+
 bool isLifted(IMUData &d) {
-  // When lifted, total acceleration drops (free-fall-like)
-  float totalAccel = sqrt(d.ax * d.ax + d.ay * d.ay + d.az * d.az);
-  return totalAccel < 0.5;  // less than 0.5g total = likely lifted
+  float totalAccel   = sqrt(d.ax * d.ax + d.ay * d.ay + d.az * d.az);
+  float rollPitchMag = sqrt(d.gx * d.gx + d.gy * d.gy);  // gz intentionally excluded
+  return totalAccel < LIFTED_ACCEL_THRESHOLD || rollPitchMag > LIFTED_GYRO_THRESHOLD;
 }
 
 // ============================================================================
@@ -98,7 +129,8 @@ void setup() {
     while (true) { ; }
   }
 
-  Serial.println(F("MPU-6050 found. Reading..."));
+  Serial.println(F("MPU-6050 found."));
+  calibrateGyro();
   Serial.println(F("Format: ax ay az (g) | gx gy gz (deg/s) | state"));
   Serial.println();
 

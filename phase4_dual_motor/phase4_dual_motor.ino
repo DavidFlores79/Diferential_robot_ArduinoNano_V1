@@ -5,12 +5,14 @@
  * Tests straight driving and differential turning.
  *
  * Connections:
- * - Encoder Left  D0 → D2 (INT0)
- * - Encoder Right D0 → D3 (INT1)
+ * - Encoder Left  → D2 (INT0)
+ * - Encoder Right → D3 (INT1)
  * - STBY → D4
  * - PWMA → D5 | AIN2 → D7 | AIN1 → D8  (left motor)
  * - PWMB → D6 | BIN1 → D9 | BIN2 → D10 (right motor)
  */
+
+#include "phase4_dual_motor.h"
 
 // ============================================================================
 // PIN DEFINITIONS
@@ -29,15 +31,19 @@ const uint8_t BIN2 = 10;
 // ============================================================================
 // TEST SEQUENCE — edit these to change behaviour
 // ============================================================================
-const float DRIVE_SPEED  = 40.0;  // p/s — straight drive speed
-const float TURN_SPEED   = 30.0;  // p/s — speed of faster wheel during turn
+const float DRIVE_SPEED  = 6.0;  // p/s — straight drive speed
+const float TURN_SPEED   = 5.0;  // p/s — speed of faster wheel during turn
 
 // ============================================================================
 // PID GAINS (tune these)
 // ============================================================================
-const float kP = 2.0;
-const float kI = 0.5;
-const float kD = 0.1;
+float kP = 1.0;
+float kI = 1.5;
+float kD = 0.1;
+
+// kI × INTEGRAL_MAX = max integral PWM contribution — must exceed steady-state PWM (~110)
+// 1.5 × 80 = 120 → just enough headroom (10 PWM margin over ~110 needed)
+const float INTEGRAL_MAX = 80.0;
 
 // ============================================================================
 // ENCODER
@@ -51,15 +57,6 @@ void encRightISR() { encRightCount++; }
 // ============================================================================
 // PID STATE
 // ============================================================================
-struct PID {
-  float target;
-  float integral;
-  float lastError;
-  long  lastCount;
-  float speed;
-  int   pwmOut;
-};
-
 PID leftPID  = {0, 0, 0, 0, 0, 0};
 PID rightPID = {0, 0, 0, 0, 0, 0};
 
@@ -69,7 +66,7 @@ PID rightPID = {0, 0, 0, 0, 0, 0};
 unsigned long lastPIDTime    = 0;
 unsigned long lastReportTime = 0;
 unsigned long stateTimer     = 0;
-const unsigned long PID_INTERVAL    = 100;
+const unsigned long PID_INTERVAL    = 200;  // 200ms → ~8 pulses/window at 40 p/s, reduces quantization noise
 const unsigned long REPORT_INTERVAL = 500;
 
 // ============================================================================
@@ -103,10 +100,13 @@ void setMotorRight(int pwm) {
 float computePID(PID &pid, long currentCount, float dt) {
   long delta    = currentCount - pid.lastCount;
   pid.lastCount = currentCount;
-  pid.speed     = delta / dt;
+  float rawSpeed = delta / dt;
+  if (rawSpeed > 30.0f) rawSpeed = pid.speed;  // discard noise spikes from PWM switching
+  pid.speed = 0.6f * pid.speed + 0.4f * rawSpeed;  // EMA: reduce pulse-count noise
 
   float error      = pid.target - pid.speed;
   pid.integral    += error * dt;
+  pid.integral     = constrain(pid.integral, -INTEGRAL_MAX, INTEGRAL_MAX);  // anti-windup
   float derivative = (error - pid.lastError) / dt;
   pid.lastError    = error;
 
@@ -123,19 +123,31 @@ void updatePID(unsigned long now) {
   long rc = encRightCount;
   interrupts();
 
-  setMotorLeft((int)computePID(leftPID, lc, dt));
-  setMotorRight((int)computePID(rightPID, rc, dt));
+  setMotorLeft((int)constrain(computePID(leftPID, lc, dt), 0, 255));
+  setMotorRight((int)constrain(computePID(rightPID, rc, dt), 0, 255));
 }
 
 // ============================================================================
 // DRIVE STATE MACHINE
 // ============================================================================
+void setTargets(float l, float r) {
+  if (l != leftPID.target) {
+    leftPID.integral = 0; leftPID.lastError = 0; leftPID.speed = 0;
+    setMotorLeft(0);
+  }
+  if (r != rightPID.target) {
+    rightPID.integral = 0; rightPID.lastError = 0; rightPID.speed = 0;
+    setMotorRight(0);
+  }
+  leftPID.target  = l;
+  rightPID.target = r;
+}
+
 void updateDriveSequence(unsigned long now) {
   switch (driveState) {
     case FORWARD:
-      leftPID.target  = DRIVE_SPEED;
-      rightPID.target = DRIVE_SPEED;
-      if (now - stateTimer >= 3000) {
+      setTargets(DRIVE_SPEED, DRIVE_SPEED);
+      if (now - stateTimer >= 7000) {
         Serial.println(F(">> Turn left"));
         stateTimer = now;
         driveState = TURN_LEFT;
@@ -143,9 +155,8 @@ void updateDriveSequence(unsigned long now) {
       break;
 
     case TURN_LEFT:
-      leftPID.target  = TURN_SPEED * 0.3;  // slow left
-      rightPID.target = TURN_SPEED;
-      if (now - stateTimer >= 1500) {
+      setTargets(TURN_SPEED * 0.3, TURN_SPEED);
+      if (now - stateTimer >= 2500) {
         Serial.println(F(">> Turn right"));
         stateTimer = now;
         driveState = TURN_RIGHT;
@@ -153,9 +164,8 @@ void updateDriveSequence(unsigned long now) {
       break;
 
     case TURN_RIGHT:
-      leftPID.target  = TURN_SPEED;
-      rightPID.target = TURN_SPEED * 0.3;  // slow right
-      if (now - stateTimer >= 1500) {
+      setTargets(TURN_SPEED, TURN_SPEED * 0.3);
+      if (now - stateTimer >= 2500) {
         Serial.println(F(">> Stop"));
         stateTimer = now;
         driveState = STOP_PAUSE;
@@ -163,8 +173,7 @@ void updateDriveSequence(unsigned long now) {
       break;
 
     case STOP_PAUSE:
-      leftPID.target  = 0;
-      rightPID.target = 0;
+      setTargets(0, 0);
       if (now - stateTimer >= 2000) {
         Serial.println(F(">> Forward"));
         stateTimer = now;
@@ -209,7 +218,7 @@ void setup() {
   Serial.println(F("\n====================================="));
   Serial.println(F("Phase 4 — Dual Motor PID Control"));
   Serial.println(F("=====================================\n"));
-  Serial.println(F("Sequence: Forward 3s → Turn left → Turn right → Stop → repeat"));
+  Serial.println(F("Sequence: Forward 7s → Turn left 2.5s → Turn right 2.5s → Stop → repeat"));
   Serial.println();
 
   pinMode(ENC_LEFT,  INPUT_PULLUP);

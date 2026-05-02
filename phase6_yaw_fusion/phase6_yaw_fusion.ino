@@ -47,6 +47,7 @@ float magOffsetY = 0;
 // ============================================================================
 // STATE
 // ============================================================================
+float gzOffset  = 0;   // gyro Z zero-rate bias (calibrated in setup)
 float yawFused  = 0;
 float yawGyro   = 0;
 
@@ -63,7 +64,31 @@ float readGyroZ() {
   Wire.endTransmission(false);
   Wire.requestFrom(MPU_ADDR, (uint8_t)2);
   int16_t raw = Wire.read() << 8 | Wire.read();
-  return raw / GYRO_SCALE;
+  return raw / GYRO_SCALE - gzOffset;
+}
+
+// ============================================================================
+// GYRO Z CALIBRATION — measures zero-rate bias while robot is still
+// ============================================================================
+void calibrateGyroZ() {
+  Serial.println(F("Calibrating gyro Z — keep robot still..."));
+  const int SAMPLES = 200;
+  float sum = 0;
+  unsigned long t = millis();
+  for (int i = 0; i < SAMPLES; i++) {
+    Wire.beginTransmission(MPU_ADDR);
+    Wire.write(GYRO_ZOUT_H);
+    Wire.endTransmission(false);
+    Wire.requestFrom(MPU_ADDR, (uint8_t)2);
+    int16_t raw = Wire.read() << 8 | Wire.read();
+    sum += raw / GYRO_SCALE;
+    while (millis() - t < 5) { ; }  // 5ms between samples (~1s total)
+    t = millis();
+  }
+  gzOffset = sum / SAMPLES;
+  Serial.print(F("Gyro Z offset: "));
+  Serial.print(gzOffset, 3);
+  Serial.println(F(" deg/s"));
 }
 
 // ============================================================================
@@ -123,9 +148,9 @@ void setup() {
 
   Wire.begin();
   initMPU();
-  delay(100);
+  unsigned long t = millis(); while (millis() - t < 100) { ; }
   initHMC();
-  delay(100);
+  t = millis(); while (millis() - t < 100) { ; }
 
   // Verify both devices
   Wire.beginTransmission(MPU_ADDR);
@@ -138,6 +163,8 @@ void setup() {
   }
 
   Serial.println(F("Both sensors found."));
+  calibrateGyroZ();
+
   Serial.println(F("NOTE: Set magOffsetX/Y after calibration for accurate heading."));
   Serial.println(F("Format: Gyro yaw | Mag heading | Fused yaw"));
   Serial.println();
@@ -161,9 +188,14 @@ void loop() {
   // Gyro integration
   yawGyro += gz * dt;
 
-  // Complementary filter
-  yawFused = ALPHA * (yawFused + gz * dt) + (1.0 - ALPHA) * magHead;
-  if (yawFused < 0)   yawFused += 360.0;
+  // Complementary filter — correct via shortest arc to avoid wrap-around jumps
+  // (e.g. yawFused=350°, magHead=5°: raw blend gives ~177°; arc gives ~0°)
+  float gyroEst  = yawFused + gz * dt;
+  float magDelta = magHead - gyroEst;
+  if (magDelta >  180) magDelta -= 360;
+  if (magDelta < -180) magDelta += 360;
+  yawFused = gyroEst + (1.0 - ALPHA) * magDelta;
+  if (yawFused <   0) yawFused += 360.0;
   if (yawFused > 360) yawFused -= 360.0;
 
   if (now - lastReportTime >= REPORT_INTERVAL) {

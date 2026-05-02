@@ -21,11 +21,18 @@ const uint8_t AIN2 = 7;
 // ============================================================================
 // PID CONFIGURATION
 // ============================================================================
-float targetSpeed = 40.0;   // pulses/second — change to test different speeds
+float targetSpeed = 80.0;   // pulses/second — change to test different speeds
 
-float kP = 2.0;
-float kI = 0.5;
+// kP: proportional — instant reaction to current error
+// kI: integral — builds up to hold steady-state PWM (must be able to reach ~110 at error=0)
+// kD: derivative — brakes against rapid speed change
+float kP = 1.0;
+float kI = 1.5;
 float kD = 0.1;
+
+// kI × INTEGRAL_MAX = max integral PWM contribution — must exceed steady-state PWM (~110)
+// 1.5 × 80 = 120 → just enough headroom (10 PWM margin over ~110 needed)
+const float INTEGRAL_MAX = 80.0;
 
 float integral   = 0;
 float lastError  = 0;
@@ -45,7 +52,7 @@ void encoderISR() {
 // ============================================================================
 unsigned long lastPIDTime    = 0;
 unsigned long lastReportTime = 0;
-const unsigned long PID_INTERVAL    = 100;   // PID runs every 100ms
+const unsigned long PID_INTERVAL    = 200;   // 200ms → ~16 pulses/window at 80p/s, halves quantization noise
 const unsigned long REPORT_INTERVAL = 500;
 
 long lastCount = 0;
@@ -90,14 +97,18 @@ void updatePID(unsigned long now) {
 
   long delta = count - lastCount;
   lastCount  = count;
-  currentSpeed = delta / dt;
+  float rawSpeed = delta / dt;
+  // EMA filter: blends new measurement (40%) with previous estimate (60%) to reduce pulse-count noise
+  currentSpeed = 0.6f * currentSpeed + 0.4f * rawSpeed;
 
   float error = targetSpeed - currentSpeed;
   integral   += error * dt;
+  integral    = constrain(integral, -INTEGRAL_MAX, INTEGRAL_MAX);  // anti-windup
   float derivative = (error - lastError) / dt;
   lastError  = error;
 
   float output = (kP * error) + (kI * integral) + (kD * derivative);
+  output = constrain(output, 0, 255);   // forward-only: no reversal on overshoot
   motorSet((int)output);
 }
 
